@@ -1,6 +1,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 use std::thread;
+use std::thread::current;
 use concurrent_queue::ConcurrentQueue;
 use mysql::*;
 use mysql::prelude::*;
@@ -8,9 +9,11 @@ use reqwest::Url;
 use serde::{Serialize};
 use select::document::Document;
 use select::predicate::Name;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{futures, Mutex, RwLock};
 
-const USER_AGENT: &str = "jackz-search-engine/v1.0";
+const USER_AGENT: &str = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; jackz-search-engine/0.1; +https://github.com/Jackzmc/search-engine-rs) Chrome/W.X.Y.Z Safari/537.36";
 
 #[derive(PartialEq, Eq, Serialize)]
 struct QueueEntry {
@@ -31,6 +34,7 @@ struct UrlEntry {
 }
 
 struct SearchEngine {
+    file: File,
     pub client: reqwest::Client,
     pub queue: ConcurrentQueue<QueueEntry>
 }
@@ -41,15 +45,16 @@ struct HtmlResult {
 }
 
 impl SearchEngine {
-    pub fn new() -> SearchEngine {
+    pub fn new(file: File) -> SearchEngine {
         SearchEngine {
+            file,
             client: reqwest::Client::new(),
             queue:  ConcurrentQueue::unbounded()
         }
     }
 
-    async fn get_html(&self, url: &str) -> Option<String> {
-        match self.client.get(url)
+    async fn get_html(&self, url: &Url) -> Option<String> {
+        match self.client.get(url.as_str())
             .header("User-Agent", USER_AGENT)
             .send()
             .await
@@ -144,8 +149,83 @@ impl SearchEngine {
         str
     }
 
-    async fn crawl(&self, url: &str) -> Option<HtmlResult> {
-        if let Some(html) = self.get_html(url).await {
+    /// Determines if robots.txt blocks us from crawling
+    async fn can_crawl(&self, url: &Url) -> bool {
+        let host = url.host();
+        if host.is_none() {
+            println!("can_crawl: invalid host for {}; skipping", url.as_str());
+            return false;
+        }
+        return match self.client.get(format!("http://{}/robots.txt", host.as_ref().unwrap()))
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+        {
+            Ok(res) => {
+                match res.text().await {
+                    Ok(text) => {
+                        let path = url.path();
+                        let mut current_user_agent: Option<String> = None;
+                        for line in text.lines() {
+                            let split: Vec<&str> = line.split(": ").collect();
+                            if split.len() == 2 {
+                                let key = split[0].to_lowercase();
+                                let value = split[1];
+                                match key.as_str() {
+                                    "user-agent" => {
+                                        println!("current user agent: {}", value);
+                                        current_user_agent = Some(value.to_string())
+                                    },
+                                    "allow" => {
+                                        if path.starts_with(value) {
+                                            println!("can_crawl: found allow for {:?} on {}", current_user_agent, url.as_str());
+                                            return true;
+                                        }
+                                    },
+                                    "disallow" => {
+                                        if path.starts_with(value) {
+                                            println!("can_crawl: found disallow for {:?} on {}", current_user_agent, url.as_str());
+                                            return false;
+                                        }
+                                    },
+                                    _ => {}
+                                }
+                            }
+                        }
+                        println!("can_crawl: no entries found, allowing");
+                        true
+                    },
+                    _ => {
+                        println!("can_crawl: Could not parse {}/robots.txt", host.unwrap());
+                        false
+                    }
+                }
+            },
+            Err(err) => {
+                if let Some(status) = err.status() {
+                    if status == 404 {
+                        println!("can_crawl: 404 on {}/robots.txt; allowing", host.unwrap());
+                        return true;
+                    }
+                }
+                println!("can_crawl: Could not fetch {}/robots.txt:\n\t{}", host.unwrap(), err);
+                false
+            }
+        }
+    }
+
+    async fn crawl(&self, raw_url: &str) -> Option<HtmlResult> {
+        let url = Url::parse(raw_url);
+        if url.is_err() {
+            eprintln!("cannot crawl {} due to error:\n\t{}", raw_url, url.unwrap_err());
+            return None;
+        }
+        let url = url.unwrap();
+        if !self.can_crawl(&url).await {
+            println!("cannot crawl {} (robots.txt disallowed); skipping", url);
+            return None
+        }
+        if let Some(html) = self.get_html(&url).await {
             let result = SearchEngine::parse_html(&html);
             let keywords = SearchEngine::extract_keywords(result.texts.iter().map(|s| &**s).collect());
             println!("results for {}", url);
@@ -169,6 +249,12 @@ impl SearchEngine {
             referrer
         };
         self.queue.push(entry).ok();
+    }
+
+    async fn record_entry(&mut self, url: &str) {
+        println!("writing {} to disk", url);
+        self.file.write(format!("{}\n", url).as_bytes()).await.ok();
+        // writeln!(&mut self.file, "{}", url).ok();
     }
 
     async fn _thread(&mut self) {
@@ -197,7 +283,8 @@ const NUM_THREADS: u16 = 2;
 
 #[tokio::main]
 async fn main() {
-    let mut engine = SearchEngine::new();
+    let mut output_file = File::create("se_links.txt").await.expect("no write output_file");
+    let mut engine = SearchEngine::new(output_file);
 
     engine.start_crawl(vec![
         "https://google.com",
@@ -215,7 +302,7 @@ async fn main() {
             println!("thread reader spawned");
             while handle.read().await.has_queued() {
                 println!("reading next url...");
-                let lock = handle.write().await;
+                let mut lock = handle.write().await;
                 let entry = lock.queue.pop().unwrap();
                 println!("url: {}", &entry.url);
                 drop(lock);
@@ -224,6 +311,7 @@ async fn main() {
                     drop(r_lock);
                     println!("got result, waiting for write lock");
                     let mut lock = handle.write().await;
+                    lock.record_entry(&entry.url).await;
                     println!("got lock, pushing {} found urls", result.links.len());
                     for link in result.links {
                         lock.enqueue(link, Some(entry.url.clone()));
