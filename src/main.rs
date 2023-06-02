@@ -8,7 +8,7 @@ use reqwest::Url;
 use serde::{Serialize};
 use select::document::Document;
 use select::predicate::Name;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{futures, Mutex, RwLock};
 
 const USER_AGENT: &str = "jackz-search-engine/v1.0";
 
@@ -193,6 +193,8 @@ impl SearchEngine {
     }
 }
 
+const NUM_THREADS: u16 = 2;
+
 #[tokio::main]
 async fn main() {
     let mut engine = SearchEngine::new();
@@ -205,32 +207,38 @@ async fn main() {
     ]);
 
     let handle = Arc::new(RwLock::new(engine));
-
-    tokio::spawn(async move {
-        let handle = handle.clone();
-        println!("thread reader spawned");
-        while handle.read().await.has_queued() {
-            println!("reading next url...");
-            let lock = handle.write().await;
-            let entry = lock.queue.pop().unwrap();
-            println!("url: {}", &entry.url);
-            drop(lock);
-            let r_lock = handle.read().await;
-            if let Some(result) = r_lock.crawl(&entry.url).await {
-                drop(r_lock);
-                println!("got result, waiting for write lock");
-                let mut lock = handle.write().await;
-                println!("got lock, pushing {} found urls", result.links.len());
-                for link in result.links {
-                    lock.enqueue(link, Some(entry.url.clone()));
-                }
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..NUM_THREADS {
+        let my_handle = handle.clone();
+        set.spawn(async move {
+            let handle = my_handle;
+            println!("thread reader spawned");
+            while handle.read().await.has_queued() {
+                println!("reading next url...");
+                let lock = handle.write().await;
+                let entry = lock.queue.pop().unwrap();
+                println!("url: {}", &entry.url);
                 drop(lock);
+                let r_lock = handle.read().await;
+                if let Some(result) = r_lock.crawl(&entry.url).await {
+                    drop(r_lock);
+                    println!("got result, waiting for write lock");
+                    let mut lock = handle.write().await;
+                    println!("got lock, pushing {} found urls", result.links.len());
+                    for link in result.links {
+                        lock.enqueue(link, Some(entry.url.clone()));
+                    }
+                    drop(lock);
+                }
+                println!("sleeping...");
+                // Arbitrary sleep
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                println!("end of iteration");
             }
-            println!("sleeping...");
-            // Arbitrary sleep
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            println!("end of iteration");
-        }
-        println!("queue empty, shutting down");
-    }).await.ok();
+            println!("queue empty, shutting down");
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+    }
 }
