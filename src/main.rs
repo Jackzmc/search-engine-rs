@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::thread;
@@ -34,20 +36,26 @@ struct UrlEntry {
 }
 
 struct SearchEngine {
-    file: File,
+    pool: Pool,
+    entries: HashMap<String, Option<String>>,
     pub client: reqwest::Client,
     pub queue: ConcurrentQueue<QueueEntry>
 }
 
 struct HtmlResult {
-    texts: Vec<String>,
+    keywords: Vec<String>,
     links: Vec<String>
 }
 
 impl SearchEngine {
-    pub fn new(file: File) -> SearchEngine {
+    pub fn new() -> SearchEngine {
+        let db_url = std::env::var("DB_URL").unwrap_or_else(|_| "mysql://localhost/searchengine".to_string());
+
+        let pool = Pool::new(db_url.as_str()).expect("could not connect to db");
+
         SearchEngine {
-            file,
+            pool,
+            entries: HashMap::new(),
             client: reqwest::Client::new(),
             queue:  ConcurrentQueue::unbounded()
         }
@@ -78,42 +86,35 @@ impl SearchEngine {
     fn parse_html(source: &str) -> HtmlResult {
         let doc = Document::from(source);
 
-        let texts = SearchEngine::extract_texts(&doc);
+        let keywords = SearchEngine::extract_keywords(&doc);
         let links = SearchEngine::extract_links(&doc);
 
-        HtmlResult { texts, links }
+        HtmlResult { keywords, links }
     }
 
-    fn extract_texts(doc: &Document) -> Vec<String> {
-        doc.find(Name("p"))
-            .filter_map(|n| n.as_text())
-            .map(|s| {
-                let t = s.to_string();
-                println!("{}", t);
-                t
-            })
-            .collect()
-    }
-
-    fn extract_links(doc: &Document) -> Vec<String> {
-        doc.find(Name("a"))
-            .filter_map(|n| n.attr("href"))
-            .map(|s| s.to_string())
-            .collect()
-    }
-
-
-    fn extract_keywords(sources: Vec<&str>) -> Vec<String> {
+    fn extract_keywords(doc: &Document) -> Vec<String> {
         let stop_words = vec![];
         let mut keywords = vec![];
-        for source in sources {
-            let mut new = keyword_extraction::rake::Rake::new(source, &stop_words)
-                .get_ranked_keyword(30);
-            keywords.append(&mut new);
-        }
+        let texts = doc.find(Name("p"))
+            .filter_map(|n| n.as_text())
+            .for_each(|source| {
+                let mut new = keyword_extraction::rake::Rake::new(source, &stop_words)
+                    .get_ranked_keyword(30);
+                keywords.append(&mut new);
+            });
         keywords
     }
 
+    fn extract_links(doc: &Document) -> Vec<String> {
+
+        let mut links = doc.find(Name("a"))
+            .filter_map(|n| n.attr("href"))
+            .map(|s| s.to_string())
+            .collect();
+        SearchEngine::deduplicate_links(links)
+    }
+
+    // TODO: need to record all links and check against that
     fn deduplicate_links(links: Vec<String>) -> Vec<String> {
         let mut result: Vec<String> = Vec::with_capacity(links.len());
         for link in links.iter() {
@@ -123,12 +124,10 @@ impl SearchEngine {
                 if !url.scheme().starts_with("http") { continue; }
                 if url.password().is_some() { continue; }
 
-                // Strip out query parameters:
-                url.query_pairs_mut().clear();
-
                 // Remove query parameters, just match base. Also remove trailing ?
-                let str = SearchEngine::normalize_url(&mut url);
+                SearchEngine::normalize_url(&mut url);
 
+                let str = url.to_string();
                 if !result.contains(&str) {
                     result.push(str);
                 }
@@ -137,16 +136,12 @@ impl SearchEngine {
         result
     }
 
-    fn normalize_url(url: &mut Url) -> String {
-        let mut str = url.to_string();
-        // Remove trailing ? and /
-        if str.ends_with("?") {
-            str.pop();
+    fn normalize_url(url: &mut Url) {
+        //Strip out ?& query parameters
+        url.set_query(None);
+        if let Ok(mut seg) = url.path_segments_mut() {
+            seg.pop_if_empty();
         }
-        if str.ends_with("/") {
-            str.pop();
-        }
-        str
     }
 
     /// Determines if robots.txt blocks us from crawling
@@ -220,24 +215,26 @@ impl SearchEngine {
             eprintln!("cannot crawl {} due to error:\n\t{}", raw_url, url.unwrap_err());
             return None;
         }
-        let url = url.unwrap();
-        if !self.can_crawl(&url).await {
+        let mut url = url.unwrap();
+        SearchEngine::normalize_url(&mut url);
+        if self.has_entry(&url) {
+            println!("cannot crawl {} (duplicate entry); skipping", url);
+            return None
+        } else if !self.can_crawl(&url).await {
             println!("cannot crawl {} (robots.txt disallowed); skipping", url);
             return None
         }
         if let Some(html) = self.get_html(&url).await {
             let result = SearchEngine::parse_html(&html);
-            let keywords = SearchEngine::extract_keywords(result.texts.iter().map(|s| &**s).collect());
             println!("results for {}", url);
-            println!("keywords {:?}", keywords);
-            let links =  SearchEngine::deduplicate_links(result.links);
-            println!("links {:?}", links);
+            println!("keywords {:?}", result.keywords);
+            println!("links {:?}", result.links);
             // for link in links {
             //     self.enqueue(link, Some(url.to_string()));
             // }
             return Some(HtmlResult {
-                links,
-                texts: keywords
+                links: result.links,
+                keywords: result.keywords
             })
         }
         None
@@ -251,11 +248,48 @@ impl SearchEngine {
         self.queue.push(entry).ok();
     }
 
-    async fn record_entry(&mut self, url: &str) {
-        println!("writing {} to disk", url);
-        self.file.write(format!("{}\n", url).as_bytes()).await.ok();
-        // writeln!(&mut self.file, "{}", url).ok();
+    async fn get_entries(&mut self) {
+        let mut conn = self.pool.get_conn().expect("could not get connection");
+        let results: Vec<QueueEntry> = conn.query_map(r"SELECT url, referrer FROM se_urls", |(url, referrer)| QueueEntry { url, referrer }).expect("could not fetch entries");
+        let count = results.len();
+        for result in results {
+            if let Ok(mut url) = Url::parse(&result.url) {
+                SearchEngine::normalize_url(&mut url);
+                self.entries.insert(url.to_string(), result.referrer);
+            }
+        }
+        println!("loaded {} saved entries", count);
     }
+
+    async fn record_entries(&mut self) {
+        let mut conn = self.pool.get_conn().expect("could not get connection");
+        conn.exec_batch(
+            r"INSERT INTO se_urls (url, referrer) VALUES (:url, :referrer)",
+            self.entries.iter().map(|e| params! {
+                "url" => e.0,
+                "referrer" => e.1,
+            })
+        ).expect("could not submit entries");
+        println!("saved {} entries", self.entries.len());
+    }
+
+    fn has_entry(&self, uri: &Url) -> bool {
+        // for e in self.entries.iter() {
+        //     println!("[e:test] {} vs {} -> {}", e.0, uri.as_str(), self.entries.contains_key(uri.as_str()));
+        // }
+        self.entries.contains_key(uri.as_str())
+    }
+
+    async fn record_entry(&mut self, url: &str, referrer: Option<String>) {
+        println!("writing {} to storage", url);
+        let mut conn = self.pool.get_conn().expect("could not get connection");
+        conn.exec_drop(r"INSERT INTO se_urls (url, referrer, queried) VALUES (:url, :referrer, UNIX_TIMESTAMP())", params! {
+            "url" => url,
+            "referrer" => &referrer
+        }).expect("could not record entry");
+        self.entries.insert(url.to_string(), referrer);
+    }
+
 
     async fn _thread(&mut self) {
         while !self.queue.is_empty() {
@@ -267,7 +301,8 @@ impl SearchEngine {
     }
 
 
-    pub fn start_crawl(&mut self, seed_urls: Vec<&str>) {
+    pub async fn start_crawl(&mut self, seed_urls: Vec<&str>) {
+        self.get_entries().await;
         for url in seed_urls {
             self.enqueue(url.to_string(), None);
         }
@@ -279,19 +314,20 @@ impl SearchEngine {
     }
 }
 
+
 const NUM_THREADS: u16 = 2;
 
 #[tokio::main]
 async fn main() {
     let mut output_file = File::create("se_links.txt").await.expect("no write output_file");
-    let mut engine = SearchEngine::new(output_file);
+    let mut engine = SearchEngine::new();
 
     engine.start_crawl(vec![
         "https://google.com",
         "https://jackz.me",
         "https://microsoft.com",
         "https://github.com"
-    ]);
+    ]).await;
 
     let handle = Arc::new(RwLock::new(engine));
     let mut set = tokio::task::JoinSet::new();
@@ -311,11 +347,12 @@ async fn main() {
                     drop(r_lock);
                     println!("got result, waiting for write lock");
                     let mut lock = handle.write().await;
-                    lock.record_entry(&entry.url).await;
+                    lock.record_entry(&entry.url, entry.referrer).await;
                     println!("got lock, pushing {} found urls", result.links.len());
                     for link in result.links {
                         lock.enqueue(link, Some(entry.url.clone()));
                     }
+                    println!("queue size: {}", lock.queue.len());
                     drop(lock);
                 }
                 println!("sleeping...");
